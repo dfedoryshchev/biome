@@ -14,7 +14,7 @@ use crate::scanner::{
     WorkspaceScannerBridge,
 };
 use crate::settings::{
-    ModuleGraphResolutionKind, SettingsHandle, SettingsWithCapability, SettingsWithEditor,
+    EditorFeature, EditorFeatures, ModuleGraphResolutionKind, SettingsHandle, SettingsWithEditor,
 };
 use crate::workspace::document::services::embedded_bindings::{
     EmbeddedBuilder, EmbeddedExportedBindings,
@@ -197,26 +197,29 @@ impl WorkspaceServer {
                     document_file_source: Some(document_file_source),
                     persist_node_cache: false,
                     inline_config: None,
-                    needs_document_services: None,
+                    editor_features: None,
                 },
             );
         }
     }
 
+    /// It creates a handle with no editor features
     fn settings_handle<'a>(
         &self,
         settings: &'a Settings,
-        editor: Option<Configuration>,
+        inline_config: Option<Configuration>,
     ) -> SettingsWithEditor<'a> {
-        SettingsHandle::new(settings, editor)
+        SettingsHandle::new(settings, (inline_config, Default::default()))
     }
 
-    fn settings_handle_with_capability<'a>(
+    /// It creates a handle with editor features
+    fn settings_handle_with_features<'a>(
         &self,
         settings: &'a Settings,
-        editor: bool,
-    ) -> SettingsWithCapability<'a> {
-        SettingsHandle::new(settings, editor)
+        inline_config: Option<Configuration>,
+        editor_features: EditorFeatures,
+    ) -> SettingsWithEditor<'a> {
+        SettingsHandle::new(settings, (inline_config, editor_features))
     }
 
     /// LSP language ids cover broad languages (`javascript`, `typescript`) but
@@ -384,7 +387,7 @@ impl WorkspaceServer {
             document_file_source,
             persist_node_cache,
             inline_config,
-            needs_document_services,
+            editor_features,
         } = params;
         let path: Utf8PathBuf = biome_path.clone().into();
 
@@ -404,11 +407,16 @@ impl WorkspaceServer {
             .projects
             .get_settings_based_on_path(project_key, &path)
             .ok_or_else(WorkspaceError::no_project)?;
+        let settings = self.settings_handle_with_features(
+            &settings,
+            inline_config,
+            editor_features.unwrap_or_default(),
+        );
 
         let mut source = if let Some(document_file_source) = document_file_source {
             let path_source = DocumentFileSource::from_path(
                 &path,
-                settings.experimental_full_html_support_enabled(),
+                settings.as_ref().experimental_full_html_support_enabled(),
             );
             // LSP language ids cannot encode path-specific framework variants like
             // `.svelte.ts` / `.svelte.js`, and HTML full support can also upgrade
@@ -420,7 +428,10 @@ impl WorkspaceServer {
                 document_file_source
             }
         } else {
-            DocumentFileSource::from_path(&path, settings.experimental_full_html_support_enabled())
+            DocumentFileSource::from_path(
+                &path,
+                settings.as_ref().experimental_full_html_support_enabled(),
+            )
         };
 
         if let DocumentFileSource::Js(js) = &mut source {
@@ -440,6 +451,7 @@ impl WorkspaceServer {
             }
             if !js.is_typescript() && !js.is_jsx() {
                 let jsx_everywhere = settings
+                    .as_ref()
                     .languages
                     .javascript
                     .parser
@@ -454,6 +466,7 @@ impl WorkspaceServer {
 
         if let DocumentFileSource::Css(css) = &mut source {
             if settings
+                .as_ref()
                 .languages
                 .css
                 .parser
@@ -463,6 +476,7 @@ impl WorkspaceServer {
             {
                 css.set_variant(CssVariant::CssModules)
             } else if settings
+                .as_ref()
                 .languages
                 .css
                 .parser
@@ -482,8 +496,7 @@ impl WorkspaceServer {
         let mut file_source_index = self.insert_source(source);
 
         let size = content.len();
-        let limit = settings.get_max_file_size(&path);
-        let settings_handle = self.settings_handle(&settings, inline_config);
+        let limit = settings.as_ref().get_max_file_size(&path);
 
         let (syntax, mut services) = if size > limit {
             (
@@ -497,7 +510,7 @@ impl WorkspaceServer {
             let parsed = self.parse(
                 &path,
                 &content,
-                &settings_handle,
+                &settings,
                 file_source_index,
                 &mut node_cache,
             )?;
@@ -511,9 +524,9 @@ impl WorkspaceServer {
             if let Some(language) = language {
                 file_source_index = self.insert_source(language);
 
-                if settings.is_linter_enabled()
-                    || settings.is_assist_enabled()
-                    || needs_document_services.unwrap_or_default()
+                if settings.as_ref().is_linter_enabled()
+                    || settings.as_ref().is_assist_enabled()
+                    || settings.needs_document_services()
                 {
                     if language.is_css_like() {
                         services = CssDocumentServices::default()
@@ -551,7 +564,7 @@ impl WorkspaceServer {
         // content.
         let embedded_snippets = if DocumentFileSource::can_contain_embeds(
             path.as_path(),
-            settings.experimental_full_html_support_enabled(),
+            settings.as_ref().experimental_full_html_support_enabled(),
         ) && let Some(Ok(any_parse)) = &syntax
         {
             // Second-pass parsing for HTML files with embedded JavaScript and CSS content
@@ -561,7 +574,7 @@ impl WorkspaceServer {
                 &source,
                 any_parse,
                 &mut node_cache,
-                &settings_handle,
+                &settings,
                 &mut builder,
             )?
         } else {
@@ -844,24 +857,21 @@ impl WorkspaceServer {
                 cursor_offset,
                 services,
             });
-            let capabilities = resolve_capabilities(&result, capabilities);
-            return Ok((result, path.clone(), capabilities));
+            if result.is_some() {
+                let capabilities = resolve_capabilities(&result, capabilities);
+                return Ok((result, path.clone(), capabilities));
+            }
         }
 
         // Check if cursor falls within an embedded snippet
         for snippet in embedded_snippets {
-            let content_range = snippet.content_range();
-            if !content_range.contains(cursor_offset) {
-                continue;
-            }
-
             let snippet_offset = snippet.content_offset();
             let local_cursor = cursor_offset - snippet_offset;
 
             let Some(file_source) = self.get_source(snippet.file_source_index()) else {
                 continue;
             };
-            let snippet_caps = self.features.get_deprecated_capabilities(file_source);
+            let snippet_caps = self.features.get_real_capabilities(file_source);
             let Some(resolve) = snippet_caps.editors.resolve_binding else {
                 continue;
             };
@@ -1880,6 +1890,7 @@ impl Workspace for WorkspaceServer {
             content,
             version,
             inline_config,
+            editor_features,
         }: ChangeFileParams,
     ) -> Result<ChangeFileResult, WorkspaceError> {
         let documents = self.documents.pin();
@@ -1900,7 +1911,11 @@ impl Workspace for WorkspaceServer {
             .projects
             .get_settings_based_on_path(project_key, &path)
             .ok_or_else(WorkspaceError::no_project)?;
-        let settings_handle = self.settings_handle(&settings, inline_config);
+        let settings = self.settings_handle_with_features(
+            &settings,
+            inline_config,
+            editor_features.unwrap_or_default(),
+        );
 
         // We remove the node cache for the document, if it exists.
         // This is done so that we need to hold the lock as short as possible
@@ -1914,10 +1929,12 @@ impl Workspace for WorkspaceServer {
         let persist_node_cache = node_cache.is_some();
         let mut node_cache = node_cache.unwrap_or_default();
 
-        let parsed = self.parse(&path, &content, &settings_handle, index, &mut node_cache)?;
+        let parsed = self.parse(&path, &content, &settings, index, &mut node_cache)?;
         let root = parsed.any_parse.unwrap_as_send_node();
-        let document_source =
-            self.get_file_source(&path, settings.experimental_full_html_support_enabled());
+        let document_source = self.get_file_source(
+            &path,
+            settings.as_ref().experimental_full_html_support_enabled(),
+        );
 
         let mut exported_bindings = EmbeddedExportedBindings::default();
         let mut builder = exported_bindings.builder();
@@ -1925,7 +1942,7 @@ impl Workspace for WorkspaceServer {
         // Second-pass parsing for HTML files with embedded JavaScript and CSS content
         let embedded_snippets = if DocumentFileSource::can_contain_embeds(
             path.as_path(),
-            settings.experimental_full_html_support_enabled(),
+            settings.as_ref().experimental_full_html_support_enabled(),
         ) {
             // Second-pass parsing for HTML files with embedded JavaScript and CSS content
             let mut node_cache = NodeCache::default();
@@ -1934,7 +1951,7 @@ impl Workspace for WorkspaceServer {
                 &document_source,
                 &parsed.any_parse,
                 &mut node_cache,
-                &settings_handle,
+                &settings,
                 &mut builder,
             )?
         } else {
@@ -1942,7 +1959,10 @@ impl Workspace for WorkspaceServer {
         };
 
         let mut services = DocumentServices::none();
-        if settings.is_linter_enabled() || settings.is_assist_enabled() {
+        if settings.as_ref().is_linter_enabled()
+            || settings.as_ref().is_assist_enabled()
+            || settings.needs_document_services()
+        {
             if document_source.is_css_like() {
                 services = CssDocumentServices::default()
                     .with_css_semantic_model(&parsed.any_parse.tree())
@@ -2721,9 +2741,14 @@ impl Workspace for WorkspaceServer {
             .get_settings_based_on_path(params.project_key, path)
             .ok_or_else(WorkspaceError::no_project)?;
 
-        let settings = self.settings_handle_with_capability(&settings, params.enabled);
+        let capability: EditorFeatures = if params.enabled {
+            EditorFeatures::default().with(EditorFeature::GotoDefinition)
+        } else {
+            EditorFeatures::default()
+        };
+        let settings = self.settings_handle_with_features(&settings, None, capability);
 
-        let has_document_services = settings.is_capability_enabled()
+        let has_document_services = settings.needs_document_services()
             || settings.as_ref().is_linter_enabled()
             || settings.as_ref().is_assist_enabled();
         if !has_document_services {
@@ -2753,44 +2778,54 @@ impl Workspace for WorkspaceServer {
             return Ok(None);
         };
 
-        if definition_ref.is_embedded() {
-            for snippet in embedded_snippets {
-                let Some(file_source) = self.get_source(snippet.file_source_index()) else {
-                    continue;
-                };
-                let snippet_caps = self.features.get_real_capabilities(file_source);
-                let Some(resolve_definition) = snippet_caps.editors.resolve_definition else {
-                    continue;
-                };
-
-                let result = resolve_definition(ResolveDefinitionParams {
-                    path: &effective_path,
-                    definition_ref: &definition_ref,
-                    module_graph: &self.module_graph,
-                    offset: Some(snippet.content_offset()),
-                });
-
-                match result {
-                    None => {}
-                    Some(result) => return Ok(Some(result)),
+        for snippet in embedded_snippets {
+            if let DefinitionReference::LocalEmbedded { range, .. } = &definition_ref {
+                let offset = snippet.content_offset();
+                let parent_range = *range + offset;
+                if !snippet.content_range().contains_range(parent_range) {
+                    continue; // This snippet didn't produce the binding
                 }
             }
 
-            Ok(None)
-        } else {
-            let resolve_definition = capabilities
-                .editors
-                .resolve_definition
-                // NOTE: here we might want to silent the error because it could be noisy
-                .ok_or_else(self.build_capability_error(path))?;
+            let Some(file_source) = self.get_source(snippet.file_source_index()) else {
+                continue;
+            };
+            let snippet_caps = self.features.get_real_capabilities(file_source);
+            let Some(resolve_definition) = snippet_caps.editors.resolve_definition else {
+                continue;
+            };
 
-            Ok(resolve_definition(ResolveDefinitionParams {
+            let result = resolve_definition(ResolveDefinitionParams {
                 path: &effective_path,
                 definition_ref: &definition_ref,
                 module_graph: &self.module_graph,
-                offset: None,
-            }))
+                offset: Some(snippet.content_offset()),
+                services: snippet.as_snippet_services(),
+            });
+
+            match result {
+                None => {}
+                Some(result) => {
+                    if !result.matches.is_empty() {
+                        return Ok(Some(result));
+                    }
+                }
+            }
         }
+
+        let resolve_definition = capabilities
+            .editors
+            .resolve_definition
+            // NOTE: here we might want to silent the error because it could be noisy
+            .ok_or_else(self.build_capability_error(path))?;
+
+        Ok(resolve_definition(ResolveDefinitionParams {
+            path: &effective_path,
+            definition_ref: &definition_ref,
+            module_graph: &self.module_graph,
+            offset: None,
+            services: &services,
+        }))
     }
 
     /// Closes a file opened in the workspace.
@@ -2986,7 +3021,7 @@ impl WorkspaceScannerBridge for WorkspaceServer {
                 persist_node_cache: false,
                 // TODO: review here, it feels wrong that we can't pass the inline config
                 inline_config: None,
-                needs_document_services: None,
+                editor_features: None,
             },
         )
         .map(|result| (result.dependencies, result.diagnostics))
