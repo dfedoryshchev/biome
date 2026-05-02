@@ -12,11 +12,22 @@ use biome_formatter::{CstFormatContext, GroupId, format_args, write};
 pub(crate) struct ScssMapLayout<'a> {
     node: &'a ScssMapExpression,
     group_id: GroupId,
+    allow_inline: bool,
 }
 
 impl<'a> ScssMapLayout<'a> {
     pub(crate) fn new(node: &'a ScssMapExpression, group_id: GroupId) -> Self {
-        Self { node, group_id }
+        Self {
+            node,
+            group_id,
+            allow_inline: false,
+        }
+    }
+
+    /// Keeps a multi-pair map inline when it fits in the current group.
+    pub(crate) fn allow_inline(mut self) -> Self {
+        self.allow_inline = true;
+        self
     }
 
     pub(crate) fn fmt(&self, f: &mut CssFormatter) -> FormatResult<()> {
@@ -122,7 +133,7 @@ impl<'a> ScssMapLayout<'a> {
                 r_paren_token.format()
             ])
             .with_group_id(Some(self.group_id))
-            .should_expand(should_expand_map_expression(self.node))]
+            .should_expand(self.should_expand())]
         )
     }
 
@@ -142,6 +153,10 @@ impl<'a> ScssMapLayout<'a> {
                 )
             }
         })
+    }
+
+    fn should_expand(&self) -> bool {
+        !self.allow_inline && should_expand_map_expression(self.node)
     }
 }
 
